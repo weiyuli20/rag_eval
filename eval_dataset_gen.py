@@ -6,7 +6,11 @@ import random
 from tqdm import tqdm
 from typing import List
 from langchain_core.documents.base import Document as LangchainDocument
-
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+import pandas as pd
+import json
+# from prompt import question_relevance_critique_prompt, question_standalone_critique_prompt, question_groundedness_critique_prompt, QA_generation_prompt
+from prompt_zh import question_relevance_critique_prompt, question_standalone_critique_prompt, question_groundedness_critique_prompt, QA_generation_prompt
 
 load_dotenv()  
 
@@ -37,28 +41,10 @@ def call_llm(llm_client: LLM, prompt: str):
 # print(res)
 
 
-QA_generation_prompt = """
-Your task is to write a factoid question and an answer given a context.
-Your factoid question should be answerable with a specific, concise piece of factual information from the context.
-Your factoid question should be formulated in the same style as questions users could ask in a search engine.
-This means that your factoid question MUST NOT mention something like "according to the passage" or "context".
-
-Provide your answer as follows:
-
-Output:::
-Factoid question: (your factoid question)
-Answer: (your answer to the factoid question)
-
-Now here is the context.
-
-Context: {context}\n
-Output:::"""
-
-
 
 def generate_qa_dataset(llm_client,docs_processed:List[LangchainDocument]):
 
-    N_GENERATIONS = 10  # We intentionally generate only 10 QA couples here for cost and time considerations
+    N_GENERATIONS = 3  # We intentionally generate only 10 QA couples here for cost and time considerations
 
     print(f"Generating {N_GENERATIONS} QA couples...")
 
@@ -85,66 +71,6 @@ def generate_qa_dataset(llm_client,docs_processed:List[LangchainDocument]):
 
 
 # 设置问题评估裁判
-
-question_groundedness_critique_prompt = """
-You will be given a context and a question.
-Your task is to provide a 'total rating' scoring how well one can answer the given question unambiguously with the given context.
-Give your answer on a scale of 1 to 5, where 1 means that the question is not answerable at all given the context, and 5 means that the question is clearly and unambiguously answerable with the context.
-
-Provide your answer as follows:
-
-Answer:::
-Evaluation: (your rationale for the rating, as a text)
-Total rating: (your rating, as a number between 1 and 5)
-
-You MUST provide values for 'Evaluation:' and 'Total rating:' in your answer.
-
-Now here are the question and context.
-
-Question: {question}\n
-Context: {context}\n
-Answer::: """
-
-question_relevance_critique_prompt = """
-You will be given a question.
-Your task is to provide a 'total rating' representing how useful this question can be to machine learning developers building NLP applications with the Hugging Face ecosystem.
-Give your answer on a scale of 1 to 5, where 1 means that the question is not useful at all, and 5 means that the question is extremely useful.
-
-Provide your answer as follows:
-
-Answer:::
-Evaluation: (your rationale for the rating, as a text)
-Total rating: (your rating, as a number between 1 and 5)
-
-You MUST provide values for 'Evaluation:' and 'Total rating:' in your answer.
-
-Now here is the question.
-
-Question: {question}\n
-Answer::: """
-
-question_standalone_critique_prompt = """
-You will be given a question.
-Your task is to provide a 'total rating' representing how context-independent this question is.
-Give your answer on a scale of 1 to 5, where 1 means that the question depends on additional information to be understood, and 5 means that the question makes sense by itself.
-For instance, if the question refers to a particular setting, like 'in the context' or 'in the document', the rating must be 1.
-The questions can contain obscure technical nouns or acronyms like Gradio, Hub, Hugging Face or Space and still be a 5: it must simply be clear to an operator with access to documentation what the question is about.
-
-For instance, "What is the name of the checkpoint from which the ViT model is imported?" should receive a 1, since there is an implicit mention of a context, thus the question is not independent from the context.
-
-Provide your answer as follows:
-
-Answer:::
-Evaluation: (your rationale for the rating, as a text)
-Total rating: (your rating, as a number between 1 and 5)
-
-You MUST provide values for 'Evaluation:' and 'Total rating:' in your answer.
-
-Now here is the question.
-
-Question: {question}\n
-Answer::: """
-
 
 
 def critic_qa(llm_client, prompt, qa_list):
@@ -184,18 +110,64 @@ def critic_qa(llm_client, prompt, qa_list):
 
 
 def filter_qa(generated_questions):
+    print("Filtering QA couples...")
+    generated_questions = pd.DataFrame(generated_questions)
     generated_questions = generated_questions.loc[
-    (generated_questions["groundedness_score"] >= 4)
-    & (generated_questions["relevance_score"] >= 4)
-    & (generated_questions["standalone_score"] >= 4)
+    (generated_questions["groundedness_score"] >= 1)
+    & (generated_questions["relevance_score"] >= 1)
+    & (generated_questions["standalone_score"] >= 1)
 ]
     
-    with open("final_eval_datasets","w",encoding="utf-8") as f:
-        f.write(generated_questions)
+    return generated_questions
 
+
+
+def load_docs(data_dir):
+    if not os.path.exists(data_dir):
+        raise FileNotFoundError(f"❌ 文档文件夹不存在：{data_dir}")
+    
+    md_files = []
+    for root, _, files in os.walk(data_dir):
+        for f in files:
+            if f.endswith("_notable.md"):
+                md_files.append(os.path.join(root, f))
+    
+    if not md_files:
+        raise ValueError(f"❌ 无 md 文件：{data_dir}")
+    
+    # 读取文档内容
+    raw_docs = []
+    for path in tqdm(md_files, desc="📄 加载文档"):
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        raw_docs.append(LangchainDocument(
+            page_content=content,
+            metadata={"source": os.path.basename(path).replace("_notable","")}  # 记录文件名作为来源
+        ))
+
+    # 切分文档
+    text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=100,
+            add_start_index=True,
+            strip_whitespace=True,
+            separators=["#","![]","\n\n", "\n",".", " ", ""],
+        )
+    doc_processed = []
+    for doc in raw_docs:
+        doc_processed += text_splitter.split_documents([doc])
+
+    print(f"✅ 共处理 {len(doc_processed)} 个文档块")
+    return doc_processed
 
 if __name__ =='__main__':
-    docs_processed=[]
+    docs_processed=load_docs("../app/data/after_process")
+    # qa_pairs=generate_qa_dataset(llm_client,docs_processed)
     qa_pairs=generate_qa_dataset(llm_client,docs_processed)
+    with open("raw_qa_pairs","w",encoding="utf-8") as f:
+        json_str = json.dumps(qa_pairs, ensure_ascii=False, indent=2)
+        f.write(json_str)
     qa_list = critic_qa(critic_llm_client,question_groundedness_critique_prompt,qa_pairs)
-    filter(qa_list)
+    eval_dataset = filter_qa(qa_list)
+    with open("final_eval_datasets","w",encoding="utf-8") as f:
+        eval_dataset.to_json(f,orient="records",force_ascii=False,indent=2)
